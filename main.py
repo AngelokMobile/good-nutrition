@@ -2,6 +2,8 @@ import os
 import json
 import random
 import logging
+import re
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 from pathlib import Path
@@ -78,6 +80,40 @@ def update_user_profile(user_id: str, profile):
     data[user_id] = profile
     save_user_data(data)
 
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ИНГРЕДИЕНТОВ ====================
+def parse_quantity(quantity_str):
+    """
+    Извлекает числовое значение и единицу измерения из строки количества.
+    Пример: "200 гр" -> (200.0, "гр")
+            "2 шт" -> (2.0, "шт")
+            "½ ст.л" -> (0.5, "ст.л")
+            "по вкусу" -> (None, "по вкусу")
+    """
+    if not quantity_str or quantity_str.strip() == "":
+        return None, ""
+    # Заменяем дробные обозначения ½, ¼ и т.п.
+    fractions = {"½": 0.5, "¼": 0.25, "¾": 0.75, "⅓": 0.333, "⅔": 0.667}
+    for frac, val in fractions.items():
+        if frac in quantity_str:
+            quantity_str = quantity_str.replace(frac, str(val))
+    # Ищем число в строке (целое или десятичное)
+    match = re.search(r'(\d+[.,]?\d*)', quantity_str)
+    if match:
+        num_str = match.group(1).replace(',', '.')
+        try:
+            number = float(num_str)
+        except:
+            number = None
+        # Остаток после числа — единица измерения
+        unit = quantity_str[match.end():].strip()
+        return number, unit
+    else:
+        return None, quantity_str.strip()
+
+def normalize_product_name(name):
+    """Приводит название продукта к единому виду."""
+    return name.strip().lower()
+
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -123,22 +159,69 @@ async def shopping_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала составь меню командой «составь меню ...»")
         return
 
-    ingredients = []
+    # Собираем все ингредиенты из меню
+    all_ingredients = []  # список словарей с name, quantity
     for day, meals in menu.items():
         for meal_name, meal_data in meals.items():
             if isinstance(meal_data, dict) and "ingredients" in meal_data:
                 for ing in meal_data["ingredients"]:
-                    ingredients.append(ing["name"])
+                    all_ingredients.append({
+                        "name": normalize_product_name(ing["name"]),
+                        "quantity": ing.get("quantity", "")
+                    })
 
-    if ingredients:
-        leftovers = profile.get("leftovers", [])
-        needed = list(set(ingredients) - set(leftovers))
-        if needed:
-            await update.message.reply_text("🛒 Список покупок:\n• " + "\n• ".join(needed))
-        else:
-            await update.message.reply_text("У тебя уже есть все необходимые продукты!")
-    else:
+    if not all_ingredients:
         await update.message.reply_text("Не удалось собрать ингредиенты (возможно, меню в упрощённом формате).")
+        return
+
+    # Суммируем ингредиенты
+    aggregated = defaultdict(lambda: {"total": 0.0, "unit": None, "items": []})
+
+    for ing in all_ingredients:
+        name = ing["name"]
+        qty_str = ing["quantity"]
+        number, unit = parse_quantity(qty_str)
+        if number is None:
+            # Если не удалось распарсить число, сохраняем исходную строку как есть
+            aggregated[name]["items"].append(qty_str)
+            continue
+        # Если для этого продукта ещё нет единицы, устанавливаем
+        if aggregated[name]["unit"] is None:
+            aggregated[name]["unit"] = unit
+        # Если единицы совпадают, суммируем
+        if aggregated[name]["unit"] == unit:
+            aggregated[name]["total"] += number
+        else:
+            # Если единицы разные, сохраняем в отдельный список как исходную строку
+            aggregated[name]["items"].append(f"{number} {unit}" if unit else str(number))
+
+    # Вычитаем leftovers (упрощённо: если продукт есть в leftovers, исключаем его полностью)
+    leftovers_set = {normalize_product_name(x) for x in profile.get("leftovers", [])}
+
+    # Формируем итоговый список
+    result_lines = []
+    for name, data in aggregated.items():
+        if name in leftovers_set:
+            continue
+        parts = []
+        if data["total"] > 0:
+            total = round(data["total"], 2)
+            unit = data["unit"] if data["unit"] else ""
+            parts.append(f"{total} {unit}".strip())
+        if data["items"]:
+            parts.extend(data["items"])
+        if parts:
+            result_lines.append(f"• {name}: {', '.join(parts)}")
+        else:
+            result_lines.append(f"• {name}")
+
+    if not result_lines:
+        await update.message.reply_text("У тебя уже есть все необходимые продукты!")
+        return
+
+    # Разбиваем на части, если слишком длинный список (Telegram ограничение 4096 символов)
+    text = "🛒 Список покупок:\n" + "\n".join(result_lines)
+    await update.message.reply_text(text)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
