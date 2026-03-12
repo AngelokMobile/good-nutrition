@@ -1,305 +1,1298 @@
-import os
-import json
-import random
-import logging
-import re
-from collections import defaultdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread
-from pathlib import Path
-from dotenv import load_dotenv
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-PORT = int(os.getenv("PORT", 10000))
-
-if not TOKEN:
-    raise ValueError("No TELEGRAM_BOT_TOKEN found in environment")
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ==================== ЗАГРУЗКА МЕНЮ ====================
-KNOWLEDGE_DIR = Path("knowledge")
-MEALS_DIR = KNOWLEDGE_DIR / "meals"
-
-def load_meals():
-    meals_db = {}
-    if not MEALS_DIR.exists():
-        logger.warning("Папка meals не найдена")
-        return meals_db
-    for file_path in MEALS_DIR.glob("*.json"):
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                cal = file_path.stem
-                meals_db[cal] = json.load(f)
-                logger.info(f"Загружено меню {cal} ккал, дней: {len(meals_db[cal])}")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки {file_path}: {e}")
-    return meals_db
-
-MEALS = load_meals()
-
-# ==================== ПОЛЬЗОВАТЕЛЬСКИЕ ДАННЫЕ ====================
-USER_DATA_FILE = Path("user_data.json")
-
-def load_user_data():
-    if not USER_DATA_FILE.exists():
-        return {}
-    try:
-        with open(USER_DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"Ошибка чтения user_data.json: {e}")
-        return {}
-
-def save_user_data(data):
-    try:
-        with open(USER_DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Ошибка записи user_data.json: {e}")
-
-def get_user_profile(user_id: str):
-    data = load_user_data()
-    if user_id not in data:
-        data[user_id] = {
-            "preferences": {},
-            "current_menu": {},
-            "leftovers": []
-        }
-        save_user_data(data)
-    return data[user_id]
-
-def update_user_profile(user_id: str, profile):
-    data = load_user_data()
-    data[user_id] = profile
-    save_user_data(data)
-
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ИНГРЕДИЕНТОВ ====================
-def parse_quantity(quantity_str):
-    """
-    Извлекает числовое значение и единицу измерения из строки количества.
-    Пример: "200 гр" -> (200.0, "гр")
-            "2 шт" -> (2.0, "шт")
-            "½ ст.л" -> (0.5, "ст.л")
-            "по вкусу" -> (None, "по вкусу")
-    """
-    if not quantity_str or quantity_str.strip() == "":
-        return None, ""
-    # Заменяем дробные обозначения ½, ¼ и т.п.
-    fractions = {"½": 0.5, "¼": 0.25, "¾": 0.75, "⅓": 0.333, "⅔": 0.667}
-    for frac, val in fractions.items():
-        if frac in quantity_str:
-            quantity_str = quantity_str.replace(frac, str(val))
-    # Ищем число в строке (целое или десятичное)
-    match = re.search(r'(\d+[.,]?\d*)', quantity_str)
-    if match:
-        num_str = match.group(1).replace(',', '.')
-        try:
-            number = float(num_str)
-        except:
-            number = None
-        # Остаток после числа — единица измерения
-        unit = quantity_str[match.end():].strip()
-        return number, unit
-    else:
-        return None, quantity_str.strip()
-
-def normalize_product_name(name):
-    """Приводит название продукта к единому виду."""
-    return name.strip().lower()
-
-# ==================== ОБРАБОТЧИКИ КОМАНД ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    get_user_profile(user_id)
-    await update.message.reply_text(
-        "🍽 Привет! Я MealPlannerBot – помогу составить меню и список покупок.\n\n"
-        "Примеры запросов:\n"
-        "• «составь меню на 3 дня 1400 ккал»\n"
-        "• /leftovers курица, помидоры, гречка\n"
-        "• /shopping_list – показать текущий список\n"
-        "• /help – подробная справка"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 Доступные команды:\n"
-        "/start – начать работу\n"
-        "/help – эта справка\n"
-        "/leftovers [список] – сообщить, какие продукты уже есть (через запятую)\n"
-        "/shopping_list – показать список покупок на основе текущего меню\n\n"
-        "Можно также писать обычные фразы, например:\n"
-        "«составь меню на 5 дней 1600 ккал»\n"
-        "«замени ужин на ...» (пока не реализовано)"
-    )
-
-async def leftovers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    profile = get_user_profile(user_id)
-    text = update.message.text.replace("/leftovers", "").strip()
-    if not text:
-        await update.message.reply_text("Укажи продукты через запятую, например: /leftovers курица, помидоры")
-        return
-    items = [item.strip().lower() for item in text.split(",") if item.strip()]
-    profile["leftovers"] = items
-    update_user_profile(user_id, profile)
-    await update.message.reply_text(f"✅ Запомнил остатки: {', '.join(items)}")
-
-async def shopping_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    profile = get_user_profile(user_id)
-    menu = profile.get("current_menu", {})
-    if not menu:
-        await update.message.reply_text("Сначала составь меню командой «составь меню ...»")
-        return
-
-    # Собираем все ингредиенты из меню
-    all_ingredients = []  # список словарей с name, quantity
-    for day, meals in menu.items():
-        for meal_name, meal_data in meals.items():
-            if isinstance(meal_data, dict) and "ingredients" in meal_data:
-                for ing in meal_data["ingredients"]:
-                    all_ingredients.append({
-                        "name": normalize_product_name(ing["name"]),
-                        "quantity": ing.get("quantity", "")
-                    })
-
-    if not all_ingredients:
-        await update.message.reply_text("Не удалось собрать ингредиенты (возможно, меню в упрощённом формате).")
-        return
-
-    # Суммируем ингредиенты
-    aggregated = defaultdict(lambda: {"total": 0.0, "unit": None, "items": []})
-
-    for ing in all_ingredients:
-        name = ing["name"]
-        qty_str = ing["quantity"]
-        number, unit = parse_quantity(qty_str)
-        if number is None:
-            # Если не удалось распарсить число, сохраняем исходную строку как есть
-            aggregated[name]["items"].append(qty_str)
-            continue
-        # Если для этого продукта ещё нет единицы, устанавливаем
-        if aggregated[name]["unit"] is None:
-            aggregated[name]["unit"] = unit
-        # Если единицы совпадают, суммируем
-        if aggregated[name]["unit"] == unit:
-            aggregated[name]["total"] += number
-        else:
-            # Если единицы разные, сохраняем в отдельный список как исходную строку
-            aggregated[name]["items"].append(f"{number} {unit}" if unit else str(number))
-
-    # Вычитаем leftovers (упрощённо: если продукт есть в leftovers, исключаем его полностью)
-    leftovers_set = {normalize_product_name(x) for x in profile.get("leftovers", [])}
-
-    # Формируем итоговый список
-    result_lines = []
-    for name, data in aggregated.items():
-        if name in leftovers_set:
-            continue
-        parts = []
-        if data["total"] > 0:
-            total = round(data["total"], 2)
-            unit = data["unit"] if data["unit"] else ""
-            parts.append(f"{total} {unit}".strip())
-        if data["items"]:
-            parts.extend(data["items"])
-        if parts:
-            result_lines.append(f"• {name}: {', '.join(parts)}")
-        else:
-            result_lines.append(f"• {name}")
-
-    if not result_lines:
-        await update.message.reply_text("У тебя уже есть все необходимые продукты!")
-        return
-
-    # Разбиваем на части, если слишком длинный список (Telegram ограничение 4096 символов)
-    text = "🛒 Список покупок:\n" + "\n".join(result_lines)
-    await update.message.reply_text(text)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    profile = get_user_profile(user_id)
-    text = update.message.text.lower()
-
-    if "составь меню" in text:
-        days = 3
-        calories = "1400"
-        words = text.split()
-        for i, word in enumerate(words):
-            if word.isdigit():
-                if i+1 < len(words) and ("дн" in words[i+1] or "день" in words[i+1]):
-                    days = int(word)
-                elif i+1 < len(words) and ("ккал" in words[i+1] or "калорий" in words[i+1]):
-                    calories = word
-                elif calories == "1400":
-                    calories = word
-        if calories not in MEALS:
-            available = ", ".join(MEALS.keys())
-            await update.message.reply_text(f"Меню на {calories} ккал нет. Доступно: {available}")
-            return
-        menu_days = list(MEALS[calories].keys())
-        selected_days = {}
-        for i in range(1, days+1):
-            day_key = random.choice(menu_days)
-            selected_days[f"day{i}"] = MEALS[calories][day_key]
-        profile["current_menu"] = selected_days
-        update_user_profile(user_id, profile)
-        response = f"🍽 Меню на {days} дней ({calories} ккал):\n\n"
-        for day_name, meals in selected_days.items():
-            response += f"*{day_name}*\n"
-            for meal_type, meal_desc in meals.items():
-                if isinstance(meal_desc, dict):
-                    response += f"  {meal_type}: {meal_desc.get('name', meal_desc)}\n"
-                else:
-                    response += f"  {meal_type}: {meal_desc}\n"
-            response += "\n"
-        await update.message.reply_text(response)
-    else:
-        await update.message.reply_text("Я пока понимаю только команды /start, /help, /leftovers, /shopping_list и фразу «составь меню».")
-
-# ==================== HTTP-СЕРВЕР ====================
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass
-
-def run_http():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"✅ HTTP-сервер запущен на порту {PORT}")
-    server.serve_forever()
-
-# ==================== ЗАПУСК ====================
-async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Запустить бота"),
-        BotCommand("help", "Справка"),
-        BotCommand("leftovers", "Сообщить остатки продуктов"),
-        BotCommand("shopping_list", "Показать список покупок"),
-    ])
-
-def main():
-    Thread(target=run_http, daemon=True).start()
-    logger.info("✅ HTTP-поток запущен")
-
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("leftovers", leftovers))
-    app.add_handler(CommandHandler("shopping_list", shopping_list))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("🤖 Бот запущен и готов к работе!")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+{
+  "day1": {
+    "breakfast": {
+      "name": "Омлет из 2 яиц, хлеб с сыром",
+      "ingredients": [
+        { "name": "яйцо", "quantity": "2 шт" },
+        { "name": "хлеб цельнозерновой", "quantity": "55 гр" },
+        { "name": "сыр твердый 35-50%", "quantity": "30 гр" }
+      ]
+    },
+    "lunch": {
+      "name": "Крупа с курицей и овощным салатом",
+      "ingredients": [
+        { "name": "крупа (гречка/булгур/полба/геркулес/бурый рис/киноа/перловая и т.п.)", "quantity": "65 гр сухая" },
+        { "name": "курица без кожи (бедро или голень)", "quantity": "110-120 гр готовая" },
+        { "name": "овощи для салата (зелень, огурцы, помидоры, перец, капуста, редис, лук)", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "яблоко", "quantity": "1 шт (100-130 гр)" }
+      ],
+      "calories": 543
+    },
+    "snack": {
+      "name": "Творог с сухофруктами",
+      "ingredients": [
+        { "name": "творог 4%", "quantity": "140 гр" },
+        { "name": "сухофрукты", "quantity": "30 гр" }
+      ],
+      "calories": 246
+    },
+    "dinner": {
+      "name": "Овощной салат с моцареллой и авокадо",
+      "ingredients": [
+        { "name": "овощи для салата", "quantity": "200 гр" },
+        { "name": "моцарелла", "quantity": "30 гр" },
+        { "name": "масло оливковое", "quantity": "1 ч.л" },
+        { "name": "авокадо", "quantity": "60 гр (опционально)" }
+      ],
+      "calories": 278
+    }
+  },
+  "day2": {
+    "breakfast": {
+      "name": "Хлеб с сыром, яйцо, овощи",
+      "ingredients": [
+        { "name": "хлеб зерновой", "quantity": "30 гр" },
+        { "name": "сыр твердый 35-50%", "quantity": "35 гр" },
+        { "name": "яйцо вареное", "quantity": "1 шт" },
+        { "name": "овощи или листья салата", "quantity": "по вкусу" }
+      ],
+      "calories": 244
+    },
+    "lunch": {
+      "name": "Крупа с курицей в соусе песто и салат",
+      "ingredients": [
+        { "name": "крупа (гречка/булгур/...)", "quantity": "60 гр сухая" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "куриная грудка", "quantity": "150 гр" },
+        { "name": "соус песто", "quantity": "2 ч.л" },
+        { "name": "помидоры черри", "quantity": "3-4 шт" },
+        { "name": "моцарелла", "quantity": "20 гр" },
+        { "name": "зефир или шоколад или сухофрукты", "quantity": "до 100 ккал" }
+      ],
+      "calories": 573
+    },
+    "snack": {
+      "name": "Творог с сухофруктами и яблоком",
+      "ingredients": [
+        { "name": "творог мягкий 4%", "quantity": "130 гр" },
+        { "name": "сухофрукты", "quantity": "35 гр" },
+        { "name": "яблоко или другой фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 258
+    },
+    "dinner": {
+      "name": "Овощной салат с курицей",
+      "ingredients": [
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "курица (как в обед)", "quantity": "120 гр" }
+      ],
+      "calories": 329
+    }
+  },
+  "day3": {
+    "breakfast": {
+      "name": "Омлет с хлебом и семгой",
+      "ingredients": [
+        { "name": "яйцо", "quantity": "2 шт" },
+        { "name": "хлеб цельнозерновой", "quantity": "30 гр" },
+        { "name": "творожный сыр", "quantity": "25 гр" },
+        { "name": "семга/форель слабосоленая", "quantity": "40 гр" }
+      ],
+      "calories": 335
+    },
+    "lunch": {
+      "name": "Крупа с рыбой и салатом",
+      "ingredients": [
+        { "name": "крупа (гречка/булгур/...)", "quantity": "65 гр сухая" },
+        { "name": "семга или скумбрия", "quantity": "120 гр готовая" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" }
+      ],
+      "calories": 500
+    },
+    "snack": {
+      "name": "Злаковый батончик и фрукт",
+      "ingredients": [
+        { "name": "батончик злаковый (без сахара) или микс орехов и сухофруктов", "quantity": "45-50 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 256
+    },
+    "dinner": {
+      "name": "Салат из свеклы с черносливом и рыба",
+      "ingredients": [
+        { "name": "свекла вареная", "quantity": "90 гр" },
+        { "name": "йогурт натуральный", "quantity": "1-2 ст.л" },
+        { "name": "чернослив", "quantity": "5 шт" },
+        { "name": "чеснок, соль по вкусу", "quantity": "" },
+        { "name": "рыба (семга/скумбрия)", "quantity": "140-150 гр" }
+      ],
+      "calories": 322
+    }
+  },
+  "day4": {
+    "breakfast": {
+      "name": "Геркулес с изюмом, сыр с хлебом",
+      "ingredients": [
+        { "name": "геркулес монастырский или традиционный", "quantity": "30 гр сухой" },
+        { "name": "изюм", "quantity": "20 гр" },
+        { "name": "мед", "quantity": "1 ч.л" },
+        { "name": "сыр твердый 45-50%", "quantity": "30 гр" },
+        { "name": "хлебец или хлеб", "quantity": "30 гр" }
+      ]
+    },
+    "lunch": {
+      "name": "Гречневая лапша, оладьи из индейки, салат",
+      "ingredients": [
+        { "name": "гречневая лапша", "quantity": "50 гр сухая" },
+        { "name": "филе индейки", "quantity": "100 гр" },
+        { "name": "сметана 10%", "quantity": "37 гр" },
+        { "name": "яйцо", "quantity": "1/4 шт" },
+        { "name": "мука цельнозерновая", "quantity": "11 гр" },
+        { "name": "соль, перец, зелень", "quantity": "по вкусу" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" }
+      ],
+      "calories": 483
+    },
+    "snack": {
+      "name": "Йогуртовый коктейль с клубникой и бананом",
+      "ingredients": [
+        { "name": "йогурт натуральный питьевой 2.5%", "quantity": "200 мл" },
+        { "name": "клубника (можно замороженная)", "quantity": "70 гр" },
+        { "name": "банан", "quantity": "100 гр" }
+      ],
+      "calories": 220
+    },
+    "dinner": {
+      "name": "Запеченый картофель, оладьи из индейки, овощи",
+      "ingredients": [
+        { "name": "картофель запеченый", "quantity": "130 гр" },
+        { "name": "оладьи из индейки (как в обед)", "quantity": "90 гр" },
+        { "name": "овощи свежие", "quantity": "100 гр" },
+        { "name": "масло растительное", "quantity": "1 ч.л" }
+      ],
+      "calories": 358
+    }
+  },
+  "day5": {
+    "breakfast": {
+      "name": "Каша с орехами и сыром",
+      "ingredients": [
+        { "name": "каша (гречка/овсянка и т.п.)", "quantity": "50 гр сухая" },
+        { "name": "орехи или арахисовая паста", "quantity": "20 гр или 1 ч.л." },
+        { "name": "сыр твердый 45%", "quantity": "35 гр" }
+      ]
+    },
+    "lunch": {
+      "name": "Печень с крупой и салатом",
+      "ingredients": [
+        { "name": "печень или субпродукты", "quantity": "120 гр" },
+        { "name": "крупа (гречка/рис/...)", "quantity": "55 гр сухая" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "1 ч.л" }
+      ],
+      "calories": 448
+    },
+    "snack": {
+      "name": "Лаваш с курицей и овощами",
+      "ingredients": [
+        { "name": "лаваш армянский", "quantity": "30 гр" },
+        { "name": "творожный сыр", "quantity": "20 гр" },
+        { "name": "овощи и листья салата", "quantity": "до 100 гр" },
+        { "name": "куриная грудка вареная", "quantity": "30 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 274
+    },
+    "dinner": {
+      "name": "Овощной салат с курицей/рыбой",
+      "ingredients": [
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "1 ч.л" },
+        { "name": "куриная грудка/рыба белая/морепродукты", "quantity": "130 гр" }
+      ]
+    }
+  },
+  "day6": {
+    "breakfast": {
+      "name": "Омлет с сыром и хлебцем",
+      "ingredients": [
+        { "name": "яйцо", "quantity": "2 шт" },
+        { "name": "хлебец", "quantity": "1 шт" },
+        { "name": "сыр твердый 45-50%", "quantity": "30 гр" }
+      ],
+      "calories": 298
+    },
+    "lunch": {
+      "name": "Фунчоза с курицей",
+      "ingredients": [
+        { "name": "филе куриной грудки", "quantity": "183 гр" },
+        { "name": "фунчоза", "quantity": "47 гр" },
+        { "name": "болгарский перец", "quantity": "1/3 шт" },
+        { "name": "морковь", "quantity": "1/6 шт" },
+        { "name": "лук репчатый", "quantity": "1/6 шт" },
+        { "name": "соевый соус", "quantity": "1 ст.л" },
+        { "name": "специи, масло", "quantity": "по необходимости" }
+      ],
+      "calories": 501
+    },
+    "snack": {
+      "name": "Орехи и ряженка/йогурт",
+      "ingredients": [
+        { "name": "орехи", "quantity": "20 гр" },
+        { "name": "ряженка или йогурт", "quantity": "250 мл или 300 гр" }
+      ]
+    },
+    "dinner": {
+      "name": "Салат с тунцом",
+      "ingredients": [
+        { "name": "пекинская капуста", "quantity": "30 гр" },
+        { "name": "помидор", "quantity": "1/3 шт" },
+        { "name": "огурец", "quantity": "1/3 шт" },
+        { "name": "фасоль консервированная", "quantity": "1.5 ст.л" },
+        { "name": "лук-шалот", "quantity": "1/3 шт" },
+        { "name": "тунец в собственном соку", "quantity": "27 гр" },
+        { "name": "яйцо", "quantity": "2/3 шт" },
+        { "name": "болгарский перец", "quantity": "1/6 шт" },
+        { "name": "масло растительное", "quantity": "2/3 ст.л" },
+        { "name": "зелень, соль", "quantity": "по вкусу" }
+      ],
+      "calories": 138
+    }
+  },
+  "day7": {
+    "breakfast": {
+      "name": "Хлеб с сыром и семгой, каша с сухофруктами",
+      "ingredients": [
+        { "name": "хлеб зерновой", "quantity": "20 гр" },
+        { "name": "творожный сыр", "quantity": "30 гр" },
+        { "name": "семга/форель слабосоленая", "quantity": "50 гр" },
+        { "name": "каша (гречка/овсянка и т.п.)", "quantity": "30 гр сухая" },
+        { "name": "сухофрукты", "quantity": "20 гр" },
+        { "name": "орехи", "quantity": "10 гр" }
+      ],
+      "calories": 412
+    },
+    "lunch": {
+      "name": "Крупа с салатом и куриными кармашками с брынзой",
+      "ingredients": [
+        { "name": "крупа", "quantity": "60 гр сухая" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "1 ч.л" },
+        { "name": "куриное филе", "quantity": "1 шт" },
+        { "name": "маслины", "quantity": "20 гр" },
+        { "name": "томаты", "quantity": "0.5 шт" },
+        { "name": "брынза", "quantity": "20 гр" },
+        { "name": "йогурт натуральный", "quantity": "0.75 ст.л" }
+      ],
+      "calories": 545
+    },
+    "snack": {
+      "name": "Орехи и ряженка/йогурт",
+      "ingredients": [
+        { "name": "орехи", "quantity": "20 гр" },
+        { "name": "ряженка или йогурт", "quantity": "250 мл или 300 гр" }
+      ]
+    },
+    "dinner": {
+      "name": "Салат с тунцом",
+      "ingredients": [
+        { "name": "пекинская капуста", "quantity": "30 гр" },
+        { "name": "помидор", "quantity": "1/3 шт" },
+        { "name": "огурец", "quantity": "1/3 шт" },
+        { "name": "фасоль консервированная", "quantity": "1.5 ст.л" },
+        { "name": "лук-шалот", "quantity": "1/3 шт" },
+        { "name": "тунец в собственном соку", "quantity": "27 гр" },
+        { "name": "яйцо", "quantity": "2/3 шт" },
+        { "name": "болгарский перец", "quantity": "1/6 шт" },
+        { "name": "масло растительное", "quantity": "2/3 ст.л" },
+        { "name": "зелень, соль", "quantity": "по вкусу" }
+      ],
+      "calories": 138
+    }
+  },
+  "day8": {
+    "breakfast": {
+      "name": "Творог с ягодами, омлет, авокадо",
+      "ingredients": [
+        { "name": "творог 5%", "quantity": "130 гр" },
+        { "name": "ягоды свежие или сухофрукты", "quantity": "100 гр или 20 гр" },
+        { "name": "омлет из 1 яйца или яйцо вареное", "quantity": "1 шт" },
+        { "name": "авокадо", "quantity": "50 гр" }
+      ],
+      "calories": 376
+    },
+    "lunch": {
+      "name": "Индейка с крупой и салатом",
+      "ingredients": [
+        { "name": "индейка", "quantity": "110 гр готовая" },
+        { "name": "крупа (греча/рис/булгур)", "quantity": "60 гр сухая" },
+        { "name": "салат овощной", "quantity": "250 гр" },
+        { "name": "масло растительное", "quantity": "2 ч.л" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 587
+    },
+    "snack": {
+      "name": "Ряженка с отрубями",
+      "ingredients": [
+        { "name": "ряженка 4% или йогурт без сахара", "quantity": "250 мл" },
+        { "name": "отруби или псиллиум", "quantity": "1 ст.л" }
+      ],
+      "calories": 218
+    },
+    "dinner": {
+      "name": "Оливье",
+      "ingredients": [
+        { "name": "куриная грудка", "quantity": "0.5 шт" },
+        { "name": "корень сельдерея", "quantity": "0.5 шт (опционально)" },
+        { "name": "зеленый горошек", "quantity": "50 гр" },
+        { "name": "морковь", "quantity": "25 гр" },
+        { "name": "огурец свежий", "quantity": "0.5 шт (60-75 гр)" },
+        { "name": "яйцо", "quantity": "0.75 шт" },
+        { "name": "сметана 10%", "quantity": "по вкусу" },
+        { "name": "лук зеленый", "quantity": "по вкусу" }
+      ],
+      "calories": 223
+    }
+  },
+  "day9": {
+    "breakfast": {
+      "name": "Яйцо, хлеб с сыром и авокадо, овощи",
+      "ingredients": [
+        { "name": "яйцо вареное", "quantity": "1 шт" },
+        { "name": "хлеб зерновой", "quantity": "70 гр" },
+        { "name": "творожный сыр", "quantity": "30 гр" },
+        { "name": "авокадо", "quantity": "40 гр" },
+        { "name": "зелень или овощи", "quantity": "до 100 гр" }
+      ],
+      "calories": 368
+    },
+    "lunch": {
+      "name": "Креветки с рисом и салатом",
+      "ingredients": [
+        { "name": "креветки или другие морепродукты", "quantity": "130 гр" },
+        { "name": "рис", "quantity": "60 гр сухой" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 549
+    },
+    "snack": {
+      "name": "Хлебцы с сыром и овощами",
+      "ingredients": [
+        { "name": "хлебец", "quantity": "2 шт" },
+        { "name": "сыр твердый 45-50%", "quantity": "40 гр" },
+        { "name": "овощи", "quantity": "100 гр" }
+      ],
+      "calories": 179
+    },
+    "dinner": {
+      "name": "Овощной салат, шампиньоны гриль, курица, хлеб",
+      "ingredients": [
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "шампиньоны свежие", "quantity": "120 гр" },
+        { "name": "оливковое масло для гриля", "quantity": "½ ч.л" },
+        { "name": "куриная грудка или индейка", "quantity": "100 гр" },
+        { "name": "хлеб цельнозерновой", "quantity": "20 гр" }
+      ]
+    }
+  },
+  "day10": {
+    "breakfast": {
+      "name": "Геркулес с изюмом, хлебец с сыром",
+      "ingredients": [
+        { "name": "геркулес", "quantity": "130 гр готового" },
+        { "name": "изюм", "quantity": "15 гр" },
+        { "name": "хлебец", "quantity": "1 шт" },
+        { "name": "сыр твердый 45-50% или моцарелла", "quantity": "25-30 гр" }
+      ],
+      "calories": 272
+    },
+    "lunch": {
+      "name": "Греческий салат, макароны, куриные голени",
+      "ingredients": [
+        { "name": "листья салата, огурцы, помидоры", "quantity": "200 гр" },
+        { "name": "фетакса", "quantity": "25 гр" },
+        { "name": "маслины", "quantity": "до 10 шт" },
+        { "name": "масло оливковое", "quantity": "½ ст.л" },
+        { "name": "макароны из твердых сортов", "quantity": "60 гр сухих" },
+        { "name": "куриные голени без кожи", "quantity": "120 гр (мясо без костей)" }
+      ],
+      "calories": 571
+    },
+    "snack": {
+      "name": "Ряженка и фрукт",
+      "ingredients": [
+        { "name": "ряженка 3.2% или йогурт/кефир", "quantity": "250 мл" },
+        { "name": "фрукт или ягоды", "quantity": "1 шт или 100 гр" }
+      ],
+      "calories": 250
+    },
+    "dinner": {
+      "name": "Куриная грудка с овощами",
+      "ingredients": [
+        { "name": "куриная грудка", "quantity": "100 гр" },
+        { "name": "овощи свежие", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "2 ч.л" }
+      ],
+      "calories": 298
+    }
+  },
+  "day11": {
+    "breakfast": {
+      "name": "Сырники со сметаной и ягодами",
+      "ingredients": [
+        { "name": "творог 5%", "quantity": "80 гр" },
+        { "name": "яйцо", "quantity": "0.5 шт" },
+        { "name": "мука рисовая или цельнозерновая", "quantity": "1 ст.л" },
+        { "name": "сахарозаменитель", "quantity": "по вкусу" },
+        { "name": "сметана 10%", "quantity": "30 гр" },
+        { "name": "ягоды свежие", "quantity": "100 гр" }
+      ],
+      "calories": 325
+    },
+    "lunch": {
+      "name": "Гречка с куриными тефтелями и салатом",
+      "ingredients": [
+        { "name": "греча или булгур", "quantity": "50 гр сухая" },
+        { "name": "фарш куриный", "quantity": "100 гр" },
+        { "name": "рис отварной", "quantity": "20 гр" },
+        { "name": "лук репчатый", "quantity": "0.125 шт" },
+        { "name": "яйцо", "quantity": "0.25 шт" },
+        { "name": "томатная паста", "quantity": "37.5 гр" },
+        { "name": "морковь", "quantity": "0.25 шт" },
+        { "name": "мука цельнозерновая", "quantity": "0.25 ч.л" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 538
+    },
+    "snack": {
+      "name": "Злаковый батончик",
+      "ingredients": [
+        { "name": "батончик злаковый без сахара", "quantity": "45 гр" }
+      ],
+      "calories": 184
+    },
+    "dinner": {
+      "name": "Тефтели, овощной салат, хлеб",
+      "ingredients": [
+        { "name": "тефтели (как в обед)", "quantity": "100 гр" },
+        { "name": "овощной салат или тушеные овощи", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "1 ст.л" },
+        { "name": "хлеб цельнозерновой", "quantity": "25 гр" }
+      ],
+      "calories": 352
+    }
+  },
+  "day12": {
+    "breakfast": {
+      "name": "Овсяноблин с сыром и помидором",
+      "ingredients": [
+        { "name": "геркулес", "quantity": "20 гр" },
+        { "name": "яйцо", "quantity": "1 шт" },
+        { "name": "молоко или вода", "quantity": "1-2 ст.л" },
+        { "name": "сыр твердый 45%", "quantity": "20 гр" },
+        { "name": "помидор", "quantity": "по вкусу" }
+      ],
+      "calories": 230
+    },
+    "lunch": {
+      "name": "Макароны с куриным суфле и салат из свеклы",
+      "ingredients": [
+        { "name": "макароны из твердых сортов", "quantity": "60 гр сухих" },
+        { "name": "куриное филе", "quantity": "130 гр" },
+        { "name": "яйцо", "quantity": "0.4 шт" },
+        { "name": "сливки 10%", "quantity": "80 мл" },
+        { "name": "брокколи", "quantity": "20 гр" },
+        { "name": "свекла запеченая", "quantity": "110 гр" },
+        { "name": "фета", "quantity": "40 гр" },
+        { "name": "руккола", "quantity": "" },
+        { "name": "масло оливковое", "quantity": "1 ч.л" },
+        { "name": "бальзамический уксус", "quantity": "½ ч.л" },
+        { "name": "грецкий орех", "quantity": "7 гр" }
+      ],
+      "calories": 610
+    },
+    "snack": {
+      "name": "Йогуртовый коктейль с клубникой и бананом",
+      "ingredients": [
+        { "name": "йогурт натуральный питьевой 1-2.5%", "quantity": "300 мл" },
+        { "name": "клубника замороженная", "quantity": "100 гр" },
+        { "name": "банан", "quantity": "60 гр" }
+      ],
+      "calories": 236
+    },
+    "dinner": {
+      "name": "Овощной салат, суфле, хлеб",
+      "ingredients": [
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "йогурт для заправки", "quantity": "по вкусу" },
+        { "name": "суфле куриное", "quantity": "150 гр" },
+        { "name": "хлеб цельнозерновой", "quantity": "20 гр" }
+      ],
+      "calories": 322
+    }
+  },
+  "day13": {
+    "breakfast": {
+      "name": "Каша с ягодами и яйцо",
+      "ingredients": [
+        { "name": "каша (гречка/овсянка)", "quantity": "40 гр сухая" },
+        { "name": "ягоды свежие или изюм", "quantity": "120 гр или 10 гр" },
+        { "name": "яйцо вареное", "quantity": "1 шт" }
+      ],
+      "calories": 226
+    },
+    "lunch": {
+      "name": "Куриный кармашек с гречкой, овощи, фрукты с орехами",
+      "ingredients": [
+        { "name": "куриное филе", "quantity": "1 шт" },
+        { "name": "гречка отварная", "quantity": "70 гр" },
+        { "name": "морковь", "quantity": "1/4 шт" },
+        { "name": "сливки 10%", "quantity": "70 мл" },
+        { "name": "овощи свежие", "quantity": "150 гр" },
+        { "name": "фрукты", "quantity": "2 шт" },
+        { "name": "орехи", "quantity": "10 гр" }
+      ],
+      "calories": 575
+    },
+    "snack": {
+      "name": "Хлеб с сыром",
+      "ingredients": [
+        { "name": "хлеб зерновой", "quantity": "60 гр" },
+        { "name": "сыр твердый 45%", "quantity": "30 гр" }
+      ],
+      "calories": 233
+    },
+    "dinner": {
+      "name": "Салат с курицей и авокадо",
+      "ingredients": [
+        { "name": "куриное мясо", "quantity": "110 гр" },
+        { "name": "авокадо", "quantity": "50 гр" },
+        { "name": "сладкий перец", "quantity": "70 гр" },
+        { "name": "красный лук", "quantity": "" },
+        { "name": "листья салата айсберг", "quantity": "" },
+        { "name": "чеснок", "quantity": "½ зубчика" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "лимонный сок", "quantity": "" },
+        { "name": "петрушка", "quantity": "" },
+        { "name": "мед", "quantity": "½ ч.л" }
+      ],
+      "calories": 368
+    }
+  },
+  "day14": {
+    "breakfast": {
+      "name": "Маггейк банановый",
+      "ingredients": [
+        { "name": "творог мягкий 4%", "quantity": "130 гр" },
+        { "name": "яйцо", "quantity": "1 шт" },
+        { "name": "мука цельнозерновая", "quantity": "1.5-2 ст.л" },
+        { "name": "банан", "quantity": "40-50 гр" },
+        { "name": "сахарозаменитель", "quantity": "" }
+      ],
+      "calories": 264
+    },
+    "lunch": {
+      "name": "Макароны из полбы, салат, морепродукты, фрукт",
+      "ingredients": [
+        { "name": "макароны из полбы или полба", "quantity": "60 гр сухая" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "1 ст.л" },
+        { "name": "морепродукты или куриное филе", "quantity": "160 гр или 100 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 579
+    },
+    "snack": {
+      "name": "Сухофрукты",
+      "ingredients": [
+        { "name": "сухофрукты", "quantity": "60 гр" }
+      ],
+      "calories": 151
+    },
+    "dinner": {
+      "name": "Куриное филе, овощи, хлеб",
+      "ingredients": [
+        { "name": "куриное филе или индейка", "quantity": "120 гр" },
+        { "name": "овощи свежие", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "1 ст.л" },
+        { "name": "хлеб цельнозерновой", "quantity": "30 гр" }
+      ],
+      "calories": 407
+    }
+  },
+  "day15": {
+    "breakfast": {
+      "name": "Хлеб с паштетом, яйца, овощи",
+      "ingredients": [
+        { "name": "хлеб зерновой", "quantity": "40 гр" },
+        { "name": "паштет из куриной печени или сыр", "quantity": "40 гр или 20 гр" },
+        { "name": "яйцо вареное", "quantity": "2 шт" },
+        { "name": "листья свежие или овощи", "quantity": "до 100 гр" }
+      ],
+      "calories": 309
+    },
+    "lunch": {
+      "name": "Куриная отбивная, крупа, салат с кукурузой и фасолью",
+      "ingredients": [
+        { "name": "куриная отбивная", "quantity": "120 гр" },
+        { "name": "крупа", "quantity": "50 гр сухая" },
+        { "name": "огурцы", "quantity": "120 гр" },
+        { "name": "айсберг или шпинат", "quantity": "по вкусу" },
+        { "name": "кукуруза консервированная", "quantity": "40 гр" },
+        { "name": "фасоль красная консервированная", "quantity": "40 гр" },
+        { "name": "масло растительное", "quantity": "1 ст.л" }
+      ],
+      "calories": 566
+    },
+    "snack": {
+      "name": "Злаковый батончик и фрукт",
+      "ingredients": [
+        { "name": "батончик злаковый", "quantity": "45 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 256
+    },
+    "dinner": {
+      "name": "Фаршированный перец",
+      "ingredients": [
+        { "name": "перец", "quantity": "1 шт" },
+        { "name": "куриное филе", "quantity": "150 гр" },
+        { "name": "кабачок", "quantity": "37 гр" },
+        { "name": "лук репчатый", "quantity": "0.5 шт" },
+        { "name": "сыр твердый до 35%", "quantity": "25 гр" },
+        { "name": "йогурт или сметана для подачи", "quantity": "" }
+      ],
+      "calories": 270
+    }
+  },
+  "day16": {
+    "breakfast": {
+      "name": "Каша с орехами и ягодами, сыр",
+      "ingredients": [
+        { "name": "каша", "quantity": "55 гр сухая" },
+        { "name": "орехи", "quantity": "10 гр" },
+        { "name": "ягоды", "quantity": "100 гр" },
+        { "name": "сыр моцарелла или твердый", "quantity": "30 гр или 20-25 гр" }
+      ]
+    },
+    "lunch": {
+      "name": "Тефтели в сметанном соусе, овощи тушеные, хлеб, банан",
+      "ingredients": [
+        { "name": "фарш индейки или курицы", "quantity": "125 гр" },
+        { "name": "лук репчатый", "quantity": "37 гр" },
+        { "name": "морковь", "quantity": "30 гр" },
+        { "name": "яйцо", "quantity": "0.25 шт" },
+        { "name": "сметана 15%", "quantity": "50 гр" },
+        { "name": "мука цельнозерновая", "quantity": "0.25 ст.л" },
+        { "name": "овощи тушеные (кабачки/цветная капуста/брокколи/стручковая фасоль)", "quantity": "250-300 гр" },
+        { "name": "хлеб", "quantity": "65 гр" },
+        { "name": "банан", "quantity": "1 шт" }
+      ],
+      "calories": 525
+    },
+    "snack": {
+      "name": "Ряженка",
+      "ingredients": [
+        { "name": "ряженка 2-4%", "quantity": "200 мл" }
+      ],
+      "calories": 124
+    },
+    "dinner": {
+      "name": "Зразы с яйцом и луком, салат",
+      "ingredients": [
+        { "name": "филе куриной грудки или индейки", "quantity": "175 гр" },
+        { "name": "яйцо (1 сырое в фарш, 3 вареных на 4 порции)", "quantity": "0.25 сырого + 0.75 вареного" },
+        { "name": "лук зеленый", "quantity": "" },
+        { "name": "лук репчатый", "quantity": "0.25 шт" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "0.5 ст.л" }
+      ],
+      "calories": 354
+    }
+  },
+  "day17": {
+    "breakfast": {
+      "name": "Омлет из белков, овощи, хлеб",
+      "ingredients": [
+        { "name": "яйцо (белки 2, желток 1)", "quantity": "2 белка + 1 желток" },
+        { "name": "молоко 2%", "quantity": "70-80 мл" },
+        { "name": "зелень", "quantity": "" },
+        { "name": "овощи свежие", "quantity": "100 гр" },
+        { "name": "хлеб зерновой", "quantity": "50 гр" }
+      ],
+      "calories": 263
+    },
+    "lunch": {
+      "name": "Семга, салат из моркови, гречневая лапша",
+      "ingredients": [
+        { "name": "семга или скумбрия", "quantity": "120 гр" },
+        { "name": "морковь тертая", "quantity": "140 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "чеснок", "quantity": "" },
+        { "name": "гречневая лапша", "quantity": "60 гр сухая" }
+      ],
+      "calories": 575
+    },
+    "snack": {
+      "name": "Злаковый батончик и фрукт",
+      "ingredients": [
+        { "name": "батончик злаковый", "quantity": "45 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 256
+    },
+    "dinner": {
+      "name": "Салат мимоза",
+      "ingredients": [
+        { "name": "тунец консервированный в соку", "quantity": "100 гр" },
+        { "name": "яйцо отварное", "quantity": "1 шт" },
+        { "name": "огурец свежий", "quantity": "100 гр" },
+        { "name": "сыр твердый 35-45%", "quantity": "30 гр" }
+      ],
+      "calories": 291
+    }
+  },
+  "day18": {
+    "breakfast": {
+      "name": "Каша с орехами, конвертик с сыром",
+      "ingredients": [
+        { "name": "крупа", "quantity": "30 гр сухая" },
+        { "name": "орехи или арахисовая паста", "quantity": "10 гр или 1 ч.л" },
+        { "name": "лаваш", "quantity": "30 гр" },
+        { "name": "творожный сыр", "quantity": "25 гр" },
+        { "name": "зелень, помидор", "quantity": "по желанию" }
+      ]
+    },
+    "lunch": {
+      "name": "Куриные крылышки, чечевица, салат из свеклы",
+      "ingredients": [
+        { "name": "куриные крылышки или ножки без кожи", "quantity": "110 гр готового мяса" },
+        { "name": "чечевица или нут", "quantity": "40 гр сухая" },
+        { "name": "свекла отварная", "quantity": "130 гр" },
+        { "name": "чернослив", "quantity": "35 гр" },
+        { "name": "масло растительное", "quantity": "1 ст.л" }
+      ],
+      "calories": 575
+    },
+    "snack": {
+      "name": "Йогурт с ягодами и орехами",
+      "ingredients": [
+        { "name": "йогурт без сахара", "quantity": "160 гр" },
+        { "name": "ягоды или фрукт", "quantity": "100 гр" },
+        { "name": "орехи", "quantity": "15 гр" }
+      ],
+      "calories": 235
+    },
+    "dinner": {
+      "name": "Рулет из индейки с кабачком",
+      "ingredients": [
+        { "name": "филе индейки", "quantity": "125 гр" },
+        { "name": "кабачок тертый", "quantity": "25 гр" },
+        { "name": "помидор мелко", "quantity": "25 гр" },
+        { "name": "сыр", "quantity": "17 гр" },
+        { "name": "йогурт натуральный", "quantity": "0.5 ст.л" }
+      ],
+      "calories": 238
+    }
+  },
+  "day19": {
+    "breakfast": {
+      "name": "Хлеб с сыром, яйцо, салат",
+      "ingredients": [
+        { "name": "хлеб зерновой", "quantity": "60 гр" },
+        { "name": "яйцо вареное", "quantity": "1 шт" },
+        { "name": "сыр твердый 45-50%", "quantity": "30 гр" },
+        { "name": "листья салата", "quantity": "горсть" }
+      ],
+      "calories": 298
+    },
+    "lunch": {
+      "name": "Курица, киноа, салат",
+      "ingredients": [
+        { "name": "курица или индейка без кожи", "quantity": "110 гр" },
+        { "name": "говядина (альтернатива)", "quantity": "90 гр" },
+        { "name": "киноа или другая крупа", "quantity": "80 гр сухая" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" }
+      ],
+      "calories": 577
+    },
+    "snack": {
+      "name": "Протеиновый батончик, банан, орехи",
+      "ingredients": [
+        { "name": "протеиновый батончик", "quantity": "40 гр" },
+        { "name": "банан", "quantity": "1 шт" },
+        { "name": "орехи", "quantity": "10 гр" }
+      ],
+      "calories": 324
+    },
+    "dinner": {
+      "name": "Овощной салат с йогуртом и курица",
+      "ingredients": [
+        { "name": "овощной салат", "quantity": "100 гр" },
+        { "name": "йогурт для заправки", "quantity": "" },
+        { "name": "курица или индейка или рыба", "quantity": "100-140 гр" }
+      ],
+      "calories": 195
+    }
+  },
+  "day20": {
+    "breakfast": {
+      "name": "Запеканка творожная со сметаной и ягодами",
+      "ingredients": [
+        { "name": "творог", "quantity": "80 гр" },
+        { "name": "яйцо", "quantity": "0.8 шт" },
+        { "name": "сметана 10-15%", "quantity": "0.8 ст.л" },
+        { "name": "мука цельнозерновая", "quantity": "0.5 ст.л" },
+        { "name": "сахар или сахарозаменитель", "quantity": "" },
+        { "name": "сметана для подачи", "quantity": "1 ст.л" },
+        { "name": "ягоды/фрукты", "quantity": "100 гр" }
+      ],
+      "calories": 266
+    },
+    "lunch": {
+      "name": "Греческий салат, гречка, курица в соусе терияки",
+      "ingredients": [
+        { "name": "овощи для греческого салата", "quantity": "150 гр" },
+        { "name": "фетакса", "quantity": "30 гр" },
+        { "name": "маслины", "quantity": "20-30 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "греча или булгур", "quantity": "70 гр сухая" },
+        { "name": "куриная грудка в соусе терияки", "quantity": "100 гр" },
+        { "name": "кунжут", "quantity": "" }
+      ],
+      "calories": 595
+    },
+    "snack": {
+      "name": "Хлебец с сыром и фрукт",
+      "ingredients": [
+        { "name": "хлебец", "quantity": "1-2 шт" },
+        { "name": "сыр (сулугуни/моцарелла/адыгейский или твердый)", "quantity": "30 гр или 20 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ]
+    },
+    "dinner": {
+      "name": "Куриные кармашки с брынзой, овощи, хлеб",
+      "ingredients": [
+        { "name": "куриные кармашки с брынзой", "quantity": "120 гр" },
+        { "name": "овощи свежие", "quantity": "150-200 гр" },
+        { "name": "хлеб цельнозерновой", "quantity": "30 гр" }
+      ],
+      "calories": 346
+    }
+  },
+  "day21": {
+    "breakfast": {
+      "name": "Авокадо с хлебом, омлет",
+      "ingredients": [
+        { "name": "авокадо", "quantity": "50 гр" },
+        { "name": "хлеб цельнозерновой", "quantity": "50 гр" },
+        { "name": "яйцо", "quantity": "2 шт" },
+        { "name": "помидоры, зелень", "quantity": "" }
+      ],
+      "calories": 342
+    },
+    "lunch": {
+      "name": "Киноа, говядина, салат с соевым соусом, фрукты",
+      "ingredients": [
+        { "name": "киноа или булгур", "quantity": "70 гр сухая" },
+        { "name": "говядина", "quantity": "70 гр" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "соевый соус", "quantity": "для заправки" },
+        { "name": "фрукты", "quantity": "2 шт" }
+      ],
+      "calories": 552
+    },
+    "snack": {
+      "name": "Ряженка или йогурт",
+      "ingredients": [
+        { "name": "ряженка 4% или йогурт питьевой", "quantity": "250 гр" }
+      ],
+      "calories": 148
+    },
+    "dinner": {
+      "name": "Умная пицца",
+      "ingredients": [
+        { "name": "фарш из куриной грудки", "quantity": "110 гр" },
+        { "name": "томатная паста", "quantity": "" },
+        { "name": "овощи (перец, помидоры, брокколи, грибы, лук)", "quantity": "200 гр" },
+        { "name": "сыр", "quantity": "20 гр" }
+      ],
+      "calories": 351
+    }
+  },
+  "day22": {
+    "breakfast": {
+      "name": "Хлебцы с сыром и рыбой, яйцо, овощи",
+      "ingredients": [
+        { "name": "хлебец", "quantity": "2 шт" },
+        { "name": "творожный сыр", "quantity": "20-30 гр" },
+        { "name": "рыба слабосоленая", "quantity": "40 гр" },
+        { "name": "овощи, зелень", "quantity": "до 100 гр" },
+        { "name": "яйцо вареное", "quantity": "1 шт" }
+      ],
+      "calories": 357
+    },
+    "lunch": {
+      "name": "Спагетти болоньезе, салат",
+      "ingredients": [
+        { "name": "спагетти из полбы или тсп", "quantity": "60 гр сухие" },
+        { "name": "говядина (фарш)", "quantity": "125 гр" },
+        { "name": "лук репчатый", "quantity": "25 гр" },
+        { "name": "чеснок", "quantity": "1 зубчик" },
+        { "name": "морковь", "quantity": "25 гр" },
+        { "name": "томаты перетертые или томатная паста", "quantity": "50 гр" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "1 ст.л" }
+      ],
+      "calories": 493
+    },
+    "snack": {
+      "name": "Злаковый батончик и ягоды/фрукт",
+      "ingredients": [
+        { "name": "злаковый батончик", "quantity": "45 гр" },
+        { "name": "ягоды или фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 260
+    },
+    "dinner": {
+      "name": "Филе индейки в соевом соусе с апельсинами",
+      "ingredients": [
+        { "name": "филе индейки", "quantity": "100 гр" },
+        { "name": "оливковое масло", "quantity": "0.25 ст.л" },
+        { "name": "апельсин", "quantity": "0.25 шт" },
+        { "name": "соевый соус", "quantity": "8.75 мл" },
+        { "name": "паприка, имбирь", "quantity": "" }
+      ],
+      "calories": 295
+    }
+  },
+  "day23": {
+    "breakfast": {
+      "name": "Блинчики из ц/з муки с джемом",
+      "ingredients": [
+        { "name": "мука цельнозерновая", "quantity": "50 гр" },
+        { "name": "яйцо", "quantity": "1 шт" },
+        { "name": "сода гашеная", "quantity": "½ ч.л" },
+        { "name": "молоко или кефир", "quantity": "до консистенции" },
+        { "name": "джем без сахара", "quantity": "2 ч.л" }
+      ],
+      "calories": 314
+    },
+    "lunch": {
+      "name": "Зразы с яйцом, картофель, салат, фрукт",
+      "ingredients": [
+        { "name": "филе куриной грудки или индейки", "quantity": "150 гр" },
+        { "name": "яйцо (1 сырое, 4 вареных на 4 порции)", "quantity": "0.25 сырого + 1 вареное" },
+        { "name": "лук зеленый", "quantity": "" },
+        { "name": "лук репчатый", "quantity": "0.25 шт" },
+        { "name": "картофель печеный или вареный", "quantity": "80 гр" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ]
+    },
+    "snack": {
+      "name": "Сыр с овощами и лаваш",
+      "ingredients": [
+        { "name": "сыр 35%", "quantity": "50 гр" },
+        { "name": "овощи", "quantity": "100 гр" },
+        { "name": "лаваш", "quantity": "30 гр" }
+      ],
+      "calories": 280
+    },
+    "dinner": {
+      "name": "Зраза или морепродукты, овощной салат",
+      "ingredients": [
+        { "name": "зраза как в обед или морепродукты", "quantity": "130 гр" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "1 ст.л" }
+      ],
+      "calories": 332
+    }
+  },
+  "day24": {
+    "breakfast": {
+      "name": "Йогурт или творог с ягодами и орехами, яйцо",
+      "ingredients": [
+        { "name": "йогурт или творог 4-5%", "quantity": "140 гр" },
+        { "name": "ягоды", "quantity": "до 100 гр" },
+        { "name": "орехи", "quantity": "15 гр" },
+        { "name": "яйцо вареное или омлет", "quantity": "1 шт" }
+      ]
+    },
+    "lunch": {
+      "name": "Салат, гречневая лапша, лосось, фрукт",
+      "ingredients": [
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "гречневая лапша", "quantity": "60 гр сухая" },
+        { "name": "лосось или форель или скумбрия", "quantity": "120 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 604
+    },
+    "snack": {
+      "name": "Ряженка с орехами",
+      "ingredients": [
+        { "name": "ряженка или йогурт питьевой", "quantity": "250 мл" },
+        { "name": "орехи", "quantity": "15 гр" }
+      ],
+      "calories": 235
+    },
+    "dinner": {
+      "name": "Овощной салат с моцареллой, минтай в омлете",
+      "ingredients": [
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "моцарелла", "quantity": "30 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "филе минтая", "quantity": "162.5 гр" },
+        { "name": "смесь овощей", "quantity": "50 гр" },
+        { "name": "молоко", "quantity": "45 мл" },
+        { "name": "яйцо", "quantity": "1 шт" }
+      ]
+    }
+  },
+  "day25": {
+    "breakfast": {
+      "name": "Омлет с сыром, хлеб, салат",
+      "ingredients": [
+        { "name": "яйцо", "quantity": "2 шт" },
+        { "name": "сыр твердый", "quantity": "20 гр" },
+        { "name": "листья салата", "quantity": "горсть" },
+        { "name": "хлеб цельнозерновой", "quantity": "40 гр" }
+      ],
+      "calories": 285
+    },
+    "lunch": {
+      "name": "Буженина из индейки, рис, салат, фрукт",
+      "ingredients": [
+        { "name": "филе индейки", "quantity": "167 гр" },
+        { "name": "чеснок, специи", "quantity": "" },
+        { "name": "рис", "quantity": "60 гр сухой" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "1 ст.л" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 630
+    },
+    "snack": {
+      "name": "Хлебец с сыром и овощи",
+      "ingredients": [
+        { "name": "хлебец", "quantity": "1-2 шт" },
+        { "name": "сыр моцарелла или сулугуни", "quantity": "30 гр" },
+        { "name": "овощи", "quantity": "100 гр" }
+      ],
+      "calories": 165
+    },
+    "dinner": {
+      "name": "Овощи тушеные, рыба",
+      "ingredients": [
+        { "name": "овощи тушеные", "quantity": "200 гр" },
+        { "name": "семга или скумбрия или лосось или говядина", "quantity": "130 гр" }
+      ],
+      "calories": 342
+    }
+  },
+  "day26": {
+    "breakfast": {
+      "name": "Сыр с хлебом и авокадо",
+      "ingredients": [
+        { "name": "сыр сулугуни/моцарелла/творожный", "quantity": "30 гр" },
+        { "name": "хлеб зерновой", "quantity": "30 гр" },
+        { "name": "авокадо", "quantity": "55 гр" }
+      ],
+      "calories": 260
+    },
+    "lunch": {
+      "name": "Гречка с рыбой, салат, фрукт",
+      "ingredients": [
+        { "name": "греча или бурый рис", "quantity": "55 гр сухая" },
+        { "name": "рыба (дорадо/палтус/хек/сибас)", "quantity": "140 гр" },
+        { "name": "овощной салат", "quantity": "150 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 550
+    },
+    "snack": {
+      "name": "Творог с сухофруктами и орехами",
+      "ingredients": [
+        { "name": "творог 5%", "quantity": "140 гр" },
+        { "name": "сухофрукты", "quantity": "30 гр" },
+        { "name": "орехи", "quantity": "20 гр" }
+      ],
+      "calories": 367
+    },
+    "dinner": {
+      "name": "Рыбные котлеты из тунца, овощи",
+      "ingredients": [
+        { "name": "тунец в собственном соку", "quantity": "0.75 банки" },
+        { "name": "яйцо", "quantity": "0.75 шт" },
+        { "name": "морковь", "quantity": "0.5 шт" },
+        { "name": "лук репчатый", "quantity": "0.5 шт" },
+        { "name": "овощи", "quantity": "200 гр" }
+      ]
+    }
+  },
+  "day27": {
+    "breakfast": {
+      "name": "Каша с сухофруктами и яйцо",
+      "ingredients": [
+        { "name": "каша", "quantity": "40 гр сухая" },
+        { "name": "сухофрукты или ягоды", "quantity": "20 гр или 80-100 гр" },
+        { "name": "яйцо вареное", "quantity": "1 шт" }
+      ]
+    },
+    "lunch": {
+      "name": "Греческий салат, рисовая лапша, морепродукты, фрукт",
+      "ingredients": [
+        { "name": "овощи для греческого салата", "quantity": "150 гр" },
+        { "name": "фетакса", "quantity": "20 гр" },
+        { "name": "масло растительное", "quantity": "2 ч.л" },
+        { "name": "рисовая лапша", "quantity": "50 гр сухая" },
+        { "name": "морепродукты", "quantity": "130 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 652
+    },
+    "snack": {
+      "name": "Яйцо с зеленым горошком",
+      "ingredients": [
+        { "name": "яйцо вареное", "quantity": "1 шт" },
+        { "name": "зеленый горошек отварной или консервированный", "quantity": "100 гр" }
+      ],
+      "calories": 142
+    },
+    "dinner": {
+      "name": "Овощной салат, курица, хлеб",
+      "ingredients": [
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "курица запеченная", "quantity": "120 гр" },
+        { "name": "хлеб цельнозерновой", "quantity": "25 гр" }
+      ],
+      "calories": 355
+    }
+  },
+  "day28": {
+    "breakfast": {
+      "name": "Йогурт, хлеб с сыром и рыбой, яйцо",
+      "ingredients": [
+        { "name": "йогурт натуральный без сахара", "quantity": "150 гр" },
+        { "name": "сыр творожный", "quantity": "25 гр" },
+        { "name": "хлеб цельнозерновой или хлебец", "quantity": "25 гр" },
+        { "name": "семга слабосоленая", "quantity": "45 гр" },
+        { "name": "яйцо вареное", "quantity": "1 шт" }
+      ],
+      "calories": 271
+    },
+    "lunch": {
+      "name": "Рис бурый, салат, рыба, фрукт",
+      "ingredients": [
+        { "name": "рис бурый или дикий", "quantity": "60 гр сухой" },
+        { "name": "овощной салат", "quantity": "250 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "рыба (треска/дорада/хек)", "quantity": "140 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 553
+    },
+    "snack": {
+      "name": "Ряженка с орехами",
+      "ingredients": [
+        { "name": "ряженка 4% или йогурт греческий 2%", "quantity": "200 мл или 170 гр" },
+        { "name": "орехи", "quantity": "15 гр" }
+      ],
+      "calories": 221
+    },
+    "dinner": {
+      "name": "Печеный картофель, мясо, овощи с йогуртом",
+      "ingredients": [
+        { "name": "картофель печеный в мундире", "quantity": "140 гр" },
+        { "name": "мясо кролик или курица", "quantity": "120 гр" },
+        { "name": "овощи", "quantity": "200 гр" },
+        { "name": "йогурт для заправки", "quantity": "2 ст.л" }
+      ]
+    }
+  },
+  "day29": {
+    "breakfast": {
+      "name": "Йогурт, омлет с сыром",
+      "ingredients": [
+        { "name": "йогурт нежирный 2%", "quantity": "170 гр" },
+        { "name": "яйцо (2 белка, 1 желток)", "quantity": "2 белка + 1 желток" },
+        { "name": "овощи", "quantity": "до 100 гр" },
+        { "name": "сыр 45-50%", "quantity": "20 гр" }
+      ],
+      "calories": 304
+    },
+    "lunch": {
+      "name": "Гречка, курица в соевом соусе, фрукт",
+      "ingredients": [
+        { "name": "греча/полба/киноа", "quantity": "60 гр сухая" },
+        { "name": "куриное филе в соевом соусе", "quantity": "120 гр" },
+        { "name": "соевый соус, чеснок", "quantity": "" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 511
+    },
+    "snack": {
+      "name": "Орехи",
+      "ingredients": [
+        { "name": "орехи", "quantity": "30 гр" }
+      ],
+      "calories": 185
+    },
+    "dinner": {
+      "name": "Рулет из индейки с кабачком, салат, хлеб",
+      "ingredients": [
+        { "name": "рулет из индейки с кабачком", "quantity": "270 гр" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "хлеб цельнозерновой", "quantity": "30 гр" }
+      ],
+      "calories": 399
+    }
+  },
+  "day30": {
+    "breakfast": {
+      "name": "Творог с ягодами, хлеб с сыром и овощами",
+      "ingredients": [
+        { "name": "творог 4%", "quantity": "150 гр" },
+        { "name": "ягоды или сухофрукты", "quantity": "80 гр или 10 гр" },
+        { "name": "хлеб зерновой", "quantity": "35 гр" },
+        { "name": "творожный сыр", "quantity": "30-35 гр" },
+        { "name": "огурцы или помидоры", "quantity": "до 100 гр" }
+      ]
+    },
+    "lunch": {
+      "name": "Макароны, салат, говядина",
+      "ingredients": [
+        { "name": "макароны твердых сортов", "quantity": "60 гр сухие" },
+        { "name": "овощной салат", "quantity": "200 гр" },
+        { "name": "масло растительное", "quantity": "½ ст.л" },
+        { "name": "говядина постная отварная или курица/рыба", "quantity": "90 гр или 100-120 гр" }
+      ],
+      "calories": 550
+    },
+    "snack": {
+      "name": "Йогурт греческий и фрукт",
+      "ingredients": [
+        { "name": "йогурт греческий 2%", "quantity": "130-140 гр" },
+        { "name": "фрукт", "quantity": "1 шт" }
+      ],
+      "calories": 192
+    },
+    "dinner": {
+      "name": "Кабачок запеченный с сыром, куриная отбивная",
+      "ingredients": [
+        { "name": "кабачок", "quantity": "200 гр" },
+        { "name": "сыр", "quantity": "25-30 гр" },
+        { "name": "чеснок, травы, масло", "quantity": "½ ст.л" },
+        { "name": "куриная отбивная", "quantity": "100 гр" }
+      ]
+    }
+  }
+}
