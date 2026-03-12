@@ -6,23 +6,20 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
 from dotenv import load_dotenv
 
-# Загружаем токен
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
-# Настройка логов
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========== ПРОСТОЙ HTTP-СЕРВЕР ДЛЯ RENDER ==========
+# ========== HTTP-СЕРВЕР ==========
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, format, *args):
-        # Не захламляем логи HTTP-сервера
         pass
 
 def run_http():
@@ -30,29 +27,48 @@ def run_http():
     logger.info(f"✅ HTTP-сервер запущен на порту {PORT}")
     server.serve_forever()
 
-# ========== ПРОСТЫЕ КОМАНДЫ ТЕЛЕГРАМ ==========
+# ========== КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Получена команда /start от {update.effective_user.id}")
-    await update.message.reply_text("✅ Бот работает! Команды: /start, /help")
+    await update.message.reply_text(
+        "🍽 Привет! Я MealPlannerBot – помогу составить меню и список покупок.\n\n"
+        "Примеры запросов:\n"
+        "• «составь меню на 3 дня 1400 ккал»\n"
+        "• /leftovers курица, помидоры, гречка\n"
+        "• /shopping_list – показать текущий список\n"
+        "• /help – подробная справка"
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Доступные команды:\n/start - приветствие\n/help - эта справка")
+    await update.message.reply_text(
+        "📖 Доступные команды:\n"
+        "/start – начать работу\n"
+        "/help – эта справка\n"
+        "/leftovers [список] – сообщить, какие продукты уже есть (через запятую)\n"
+        "/shopping_list – показать список покупок на основе текущего меню\n\n"
+        "Можно также писать обычные фразы, например:\n"
+        "«составь меню на 5 дней 1600 ккал»"
+    )
+
+async def leftovers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Пока просто подтверждение
+    await update.message.reply_text("✅ Функция leftovers пока в разработке")
+
+async def shopping_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🛒 Функция shopping_list пока в разработке")
 
 # ========== ЗАПУСК ==========
 def main():
-    # Запускаем HTTP-сервер в отдельном потоке
-    http_thread = Thread(target=run_http, daemon=True)
-    http_thread.start()
+    Thread(target=run_http, daemon=True).start()
     logger.info("✅ HTTP-поток запущен")
 
-    # Запускаем бота
-    logger.info("🤖 Запуск Telegram-бота...")
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("leftovers", leftovers))
+    app.add_handler(CommandHandler("shopping_list", shopping_list))
 
-    logger.info("🎉 Бот запущен и готов к работе!")
-    application.run_polling()
+    logger.info("🤖 Бот запущен и готов к работе!")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
