@@ -2,14 +2,21 @@ import os
 import json
 import random
 import logging
+import asyncio
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Загрузка переменных окружения (для локального теста; на Render они будут в системе)
+# Для фиктивного веб-сервера
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Загрузка переменных окружения
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+PORT = int(os.getenv("PORT", 10000))  # Render передаёт PORT, по умолчанию 10000
+
 if not TOKEN:
     raise ValueError("No TELEGRAM_BOT_TOKEN found in environment")
 
@@ -32,7 +39,7 @@ def load_meals():
     for file_path in MEALS_DIR.glob("*.json"):
         try:
             with open(file_path, "r", encoding="utf-8") as f:
-                cal = file_path.stem  # имя файла без расширения, например "1250"
+                cal = file_path.stem
                 meals_db[cal] = json.load(f)
                 logger.info(f"Загружено меню {cal} ккал, дней: {len(meals_db[cal])}")
         except Exception as e:
@@ -45,7 +52,6 @@ MEALS = load_meals()
 USER_DATA_FILE = Path("user_data.json")
 
 def load_user_data():
-    """Читает user_data.json, возвращает словарь."""
     if not USER_DATA_FILE.exists():
         return {}
     try:
@@ -56,37 +62,32 @@ def load_user_data():
         return {}
 
 def save_user_data(data):
-    """Сохраняет словарь в user_data.json."""
     try:
         with open(USER_DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"Ошибка записи user_data.json: {e}")
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def get_user_profile(user_id: str):
-    """Возвращает профиль пользователя (словарь с данными)."""
     data = load_user_data()
     if user_id not in data:
         data[user_id] = {
-            "preferences": {},       # калории, количество персон и т.д.
-            "current_menu": {},      # текущее выбранное меню
-            "leftovers": []          # список остатков
+            "preferences": {},
+            "current_menu": {},
+            "leftovers": []
         }
         save_user_data(data)
     return data[user_id]
 
 def update_user_profile(user_id: str, profile):
-    """Обновляет профиль пользователя."""
     data = load_user_data()
     data[user_id] = profile
     save_user_data(data)
 
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветственное сообщение."""
     user_id = str(update.effective_user.id)
-    get_user_profile(user_id)  # создаём запись, если нет
+    get_user_profile(user_id)
     await update.message.reply_text(
         "🍽 Привет! Я MealPlannerBot – помогу составить меню и список покупок.\n\n"
         "Примеры запросов:\n"
@@ -97,7 +98,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Справка."""
     await update.message.reply_text(
         "📖 Доступные команды:\n"
         "/start – начать работу\n"
@@ -110,75 +110,60 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def leftovers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохраняет список остатков."""
     user_id = str(update.effective_user.id)
     profile = get_user_profile(user_id)
     text = update.message.text.replace("/leftovers", "").strip()
     if not text:
         await update.message.reply_text("Укажи продукты через запятую, например: /leftovers курица, помидоры")
         return
-    # Разбираем список
     items = [item.strip().lower() for item in text.split(",") if item.strip()]
     profile["leftovers"] = items
     update_user_profile(user_id, profile)
     await update.message.reply_text(f"✅ Запомнил остатки: {', '.join(items)}")
 
 async def shopping_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Формирует список покупок из текущего меню (упрощённо)."""
     user_id = str(update.effective_user.id)
     profile = get_user_profile(user_id)
     menu = profile.get("current_menu", {})
     if not menu:
         await update.message.reply_text("Сначала составь меню командой «составь меню ...»")
         return
-    # Простой сбор ингредиентов (для теста выводим все названия блюд)
-    # В будущем здесь нужно будет парсить ингредиенты из JSON
+    
     ingredients = []
     for day, meals in menu.items():
         for meal_name, meal_data in meals.items():
             if isinstance(meal_data, dict) and "ingredients" in meal_data:
                 for ing in meal_data["ingredients"]:
                     ingredients.append(ing["name"])
-            else:
-                # Если данные в простом формате (строка) – пока игнорируем
-                pass
+    
     if ingredients:
-        # Убираем дубликаты и вычитаем leftovers
         leftovers = profile.get("leftovers", [])
         needed = list(set(ingredients) - set(leftovers))
         await update.message.reply_text("🛒 Список покупок:\n• " + "\n• ".join(needed))
     else:
         await update.message.reply_text("Не удалось собрать ингредиенты (возможно, меню в упрощённом формате).")
 
-# ==================== ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает естественно-языковые запросы."""
     user_id = str(update.effective_user.id)
     profile = get_user_profile(user_id)
     text = update.message.text.lower()
 
-    # Очень простой парсер для демо
     if "составь меню" in text:
-        # Пытаемся извлечь калории и дни
-        days = 3  # по умолчанию
-        calories = "1400"  # по умолчанию
+        days = 3
+        calories = "1400"
         words = text.split()
         for i, word in enumerate(words):
             if word.isdigit():
-                # Если число стоит рядом со словом "дней" или "дня"
                 if i+1 < len(words) and ("дн" in words[i+1] or "день" in words[i+1]):
                     days = int(word)
                 elif i+1 < len(words) and ("ккал" in words[i+1] or "калорий" in words[i+1]):
                     calories = word
-                # Если просто число – считаем калориями (упрощённо)
                 elif calories == "1400":
                     calories = word
-        # Проверяем, есть ли такое меню в базе
         if calories not in MEALS:
             available = ", ".join(MEALS.keys())
             await update.message.reply_text(f"Меню на {calories} ккал нет. Доступно: {available}")
             return
-        # Выбираем случайные дни из меню (можем повторять)
         menu_days = list(MEALS[calories].keys())
         selected_days = {}
         for i in range(1, days+1):
@@ -186,13 +171,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             selected_days[f"day{i}"] = MEALS[calories][day_key]
         profile["current_menu"] = selected_days
         update_user_profile(user_id, profile)
-        # Формируем ответ
         response = f"🍽 Меню на {days} дней ({calories} ккал):\n\n"
         for day_name, meals in selected_days.items():
             response += f"*{day_name}*\n"
             for meal_type, meal_desc in meals.items():
                 if isinstance(meal_desc, dict):
-                    # если в JSON есть структура с именем и ингредиентами
                     response += f"  {meal_type}: {meal_desc.get('name', meal_desc)}\n"
                 else:
                     response += f"  {meal_type}: {meal_desc}\n"
@@ -201,9 +184,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Я пока понимаю только команды /start, /help, /leftovers, /shopping_list и фразу «составь меню».")
 
-# ==================== НАСТРОЙКА И ЗАПУСК ====================
+# ==================== ФИКТИВНЫЙ ВЕБ-СЕРВЕР ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        # Подавляем лишние логи от HTTP-сервера
+        return
+
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    logger.info(f"HTTP сервер запущен на порту {PORT}")
+    server.serve_forever()
+
+# ==================== ЗАПУСК БОТА ====================
 async def post_init(application: Application):
-    """Устанавливает команды бота в интерфейсе Telegram."""
     await application.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
         BotCommand("help", "Справка"),
@@ -211,8 +209,7 @@ async def post_init(application: Application):
         BotCommand("shopping_list", "Показать список покупок"),
     ])
 
-def main():
-    """Точка входа."""
+def run_bot():
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -222,6 +219,13 @@ def main():
 
     logger.info("Бот запущен...")
     application.run_polling()
+
+def main():
+    # Запускаем HTTP-сервер в отдельном потоке
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    http_thread.start()
+    # Запускаем бота в основном потоке
+    run_bot()
 
 if __name__ == "__main__":
     main()
