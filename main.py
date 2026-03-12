@@ -3,35 +3,29 @@ import json
 import random
 import logging
 import asyncio
-import threading
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from aiohttp import web
 
-# Для фиктивного веб-сервера
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-# Загрузка переменных окружения
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-PORT = int(os.getenv("PORT", 10000))  # Render передаёт PORT, по умолчанию 10000
+PORT = int(os.getenv("PORT", 10000))
 
 if not TOKEN:
     raise ValueError("No TELEGRAM_BOT_TOKEN found in environment")
 
-# Настройка логирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ==================== ЗАГРУЗКА БАЗЫ ЗНАНИЙ ====================
+# ==================== ЗАГРУЗКА МЕНЮ ====================
 KNOWLEDGE_DIR = Path("knowledge")
 MEALS_DIR = KNOWLEDGE_DIR / "meals"
 
 def load_meals():
-    """Загружает все меню из JSON-файлов в папке knowledge/meals."""
     meals_db = {}
     if not MEALS_DIR.exists():
         logger.warning("Папка meals не найдена")
@@ -48,7 +42,7 @@ def load_meals():
 
 MEALS = load_meals()
 
-# ==================== РАБОТА С ПОЛЬЗОВАТЕЛЬСКИМИ ДАННЫМИ ====================
+# ==================== ПОЛЬЗОВАТЕЛЬСКИЕ ДАННЫЕ ====================
 USER_DATA_FILE = Path("user_data.json")
 
 def load_user_data():
@@ -71,11 +65,7 @@ def save_user_data(data):
 def get_user_profile(user_id: str):
     data = load_user_data()
     if user_id not in data:
-        data[user_id] = {
-            "preferences": {},
-            "current_menu": {},
-            "leftovers": []
-        }
+        data[user_id] = {"preferences": {}, "current_menu": {}, "leftovers": []}
         save_user_data(data)
     return data[user_id]
 
@@ -184,23 +174,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Я пока понимаю только команды /start, /help, /leftovers, /shopping_list и фразу «составь меню».")
 
-# ==================== ФИКТИВНЫЙ ВЕБ-СЕРВЕР ====================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
+# ==================== HTTP-СЕРВЕР (ЗАПУСКАЕТСЯ ПЕРВЫМ) ====================
+async def health_check(request):
+    return web.Response(text="Bot is running")
 
-    def log_message(self, format, *args):
-        # Подавляем лишние логи от HTTP-сервера
-        return
+async def run_http_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"✅ HTTP-сервер запущен на порту {PORT}")
+    # Сервер остаётся работать в фоне
 
-def run_http_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    logger.info(f"HTTP сервер запущен на порту {PORT}")
-    server.serve_forever()
+async def main():
+    # Сначала запускаем HTTP-сервер (чтобы Render увидел порт)
+    await run_http_server()
+    
+    # Затем запускаем бота
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("leftovers", leftovers))
+    application.add_handler(CommandHandler("shopping_list", shopping_list))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# ==================== ЗАПУСК БОТА ====================
+    logger.info("🤖 Бот запущен и готов к работе")
+    await application.run_polling()
+
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
@@ -209,23 +211,5 @@ async def post_init(application: Application):
         BotCommand("shopping_list", "Показать список покупок"),
     ])
 
-def run_bot():
-    application = Application.builder().token(TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("leftovers", leftovers))
-    application.add_handler(CommandHandler("shopping_list", shopping_list))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Бот запущен...")
-    application.run_polling()
-
-def main():
-    # Запускаем HTTP-сервер в отдельном потоке
-    http_thread = threading.Thread(target=run_http_server, daemon=True)
-    http_thread.start()
-    # Запускаем бота в основном потоке
-    run_bot()
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
